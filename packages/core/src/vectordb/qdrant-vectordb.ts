@@ -1,6 +1,8 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import type { Schemas } from '@qdrant/js-client-rest/dist/types/types';
 import * as crypto from 'crypto';
+import * as path from 'path';
+import * as os from 'os';
 import {
     VectorDatabase,
     VectorDocument,
@@ -11,6 +13,7 @@ import {
     HybridSearchResult,
     RerankStrategy
 } from './types';
+import { BM25Tokenizer } from './bm25-tokenizer';
 
 type ScoredPoint = Schemas['ScoredPoint'];
 type ScrollResult = Schemas['ScrollResult'];
@@ -52,92 +55,47 @@ export interface QdrantConfig {
         sparse?: QdrantSparseIndexConfig;
     };
     bm25?: QdrantBM25Config;
+    vocabularyPath?: string;  // Path to store vocabulary for BM25 tokenization
 }
 
-/**
- * Simple vocabulary management for BM25 scoring
- */
-class VocabularyManager {
-    private vocabulary = new Map<string, number>(); // word -> index
-    private wordCounts = new Map<string, number>(); // word -> frequency
-    private docCount = 0;
-    private config: QdrantBM25Config;
-
-    constructor(config: QdrantBM25Config) {
-        this.config = {
-            k1: 1.2,
-            b: 0.75,
-            min_word_len: 3,
-            max_vocab_size: 50000,
-            ...config
-        };
-    }
-
-    /**
-     * Simple tokenization - just split and filter
-     */
-    private tokenize(text: string): string[] {
-        return text
-            .toLowerCase()
-            .replace(/[^\w\s]/g, ' ')
-            .split(/\s+/)
-            .filter(word => word.length >= this.config.min_word_len!);
-    }
-
-    /**
-     * Add document to vocabulary
-     */
-    addDocument(text: string): void {
-        const tokens = this.tokenize(text);
-        const uniqueWords = new Set(tokens);
-        
-        this.docCount++;
-
-        for (const word of uniqueWords) {
-            if (!this.vocabulary.has(word) && this.vocabulary.size < this.config.max_vocab_size!) {
-                this.vocabulary.set(word, this.vocabulary.size);
-            }
-            this.wordCounts.set(word, (this.wordCounts.get(word) || 0) + 1);
-        }
-    }
-
-    /**
-     * Generate simple sparse vector (just term frequency)
-     */
-    generateBM25Vector(text: string): { indices: number[]; values: number[] } {
-        const tokens = this.tokenize(text);
-        const termFreqs = new Map<string, number>();
-        
-        // Count term frequencies
-        for (const token of tokens) {
-            termFreqs.set(token, (termFreqs.get(token) || 0) + 1);
-        }
-
-        const indices: number[] = [];
-        const values: number[] = [];
-
-        for (const [word, tf] of termFreqs.entries()) {
-            const vocabIndex = this.vocabulary.get(word);
-            if (vocabIndex !== undefined) {
-                indices.push(vocabIndex);
-                values.push(tf); // Just use term frequency
-            }
-        }
-
-        return { indices, values };
-    }
-}
 
 export class QdrantVectorDatabase implements VectorDatabase {
     private client: QdrantClient | null = null;
     private config: QdrantConfig;
-    private vocabularyManagers = new Map<string, VocabularyManager>(); // collection -> vocab manager
+    private tokenizers: Map<string, BM25Tokenizer> = new Map();
     private initializationPromise: Promise<void>;
 
     constructor(config: QdrantConfig) {
         this.config = config;
-        // Start initialization asynchronously without waiting
         this.initializationPromise = this.initialize();
+    }
+    
+    /**
+     * Get or create tokenizer for a specific collection
+     * Uses collection name to create a consistent vocabulary path
+     */
+    private getTokenizer(collectionName: string): BM25Tokenizer {
+        if (!this.tokenizers.has(collectionName)) {
+            const vocabularyPath = this.config.vocabularyPath || this.getVocabularyPathFromCollection(collectionName);
+            this.tokenizers.set(collectionName, new BM25Tokenizer(vocabularyPath));
+        }
+        return this.tokenizers.get(collectionName)!;
+    }
+    
+    /**
+     * Get vocabulary path from collection name
+     * Collection name format: "{prefix}_{hash}" where hash is first 8 chars of codebase path hash
+     */
+    private getVocabularyPathFromCollection(collectionName: string): string {
+        const homeDir = os.homedir();
+        const vocabularyDir = path.join(homeDir, '.context', 'vocabulary');
+        
+        // Extract hash from collection name (format: "prefix_hash")
+        const parts = collectionName.split('_');
+        const collectionHash = parts[parts.length - 1]; // Get the last part which should be the hash
+        const vocabularyFile = `vocabulary-${collectionHash}.json`;
+        
+        return path.join(vocabularyDir, vocabularyFile);
     }
 
     private async initialize(): Promise<void> {
@@ -194,18 +152,6 @@ export class QdrantVectorDatabase implements VectorDatabase {
         throw lastError!;
     }
 
-    /**
-     * Get or create vocabulary manager for a collection
-     */
-    private getVocabularyManager(collectionName: string): VocabularyManager {
-        if (!this.vocabularyManagers.has(collectionName)) {
-            this.vocabularyManagers.set(
-                collectionName, 
-                new VocabularyManager(this.config.bm25 || {})
-            );
-        }
-        return this.vocabularyManagers.get(collectionName)!;
-    }
 
     async createCollection(collectionName: string, dimension: number, description?: string): Promise<void> {
         await this.ensureInitialized();
@@ -313,8 +259,9 @@ export class QdrantVectorDatabase implements VectorDatabase {
                 console.log(`[QdrantDB] 🗜️  Dense vector using ${quantConfig.type} quantization`);
             }
 
-            // Prepare sparse vector configuration
+            // Prepare sparse vector configuration with IDF modifier
             const sparseVectorConfig: any = {
+                modifier: "idf",
                 index: {
                     on_disk: this.config.indexing?.sparse?.on_disk ?? true, // Default on disk for memory efficiency
                 }
@@ -343,7 +290,7 @@ export class QdrantVectorDatabase implements VectorDatabase {
                 `Create hybrid collection '${collectionName}'`
             );
             console.log(`[QdrantDB] ✅ Hybrid collection '${collectionName}' created successfully`);
-            console.log(`[QdrantDB] 📊 Features: Dense vectors (${dimension}D, HNSW + ${this.config.quantization?.type || 'no'} quantization) + Sparse vectors (BM25, ${sparseVectorConfig.index.on_disk ? 'on-disk' : 'in-memory'})`);
+            console.log(`[QdrantDB] 📊 Features: Dense vectors (${dimension}D, HNSW + ${this.config.quantization?.type || 'no'} quantization) + Sparse vectors (BM25 with IDF modifier, ${sparseVectorConfig.index.on_disk ? 'on-disk' : 'in-memory'})`);
             
         } catch (error) {
             console.error(`[QdrantDB] ❌ Failed to create optimized hybrid collection '${collectionName}':`, error);
@@ -356,6 +303,12 @@ export class QdrantVectorDatabase implements VectorDatabase {
 
         try {
             await this.client!.deleteCollection(collectionName);
+            
+            // Clean up associated vocabulary tokenizer from memory
+            if (this.tokenizers.has(collectionName)) {
+                this.tokenizers.delete(collectionName);
+            }
+            
             console.log(`[QdrantDB] ✅ Collection '${collectionName}' deleted successfully`);
         } catch (error) {
             console.error(`[QdrantDB] ❌ Failed to delete collection '${collectionName}':`, error);
@@ -486,15 +439,10 @@ export class QdrantVectorDatabase implements VectorDatabase {
                     throw new Error(`Document ${index} (${doc.id}) has empty vector`);
                 }
 
-                // Generate BM25 sparse vector using vocabulary manager
-                const vocabManager = this.getVocabularyManager(collectionName);
-                
-                // First pass: add document to vocabulary for IDF calculation
-                vocabManager.addDocument(doc.content);
-                
-                // Second pass: generate BM25 vector
-                const sparseVector = vocabManager.generateBM25Vector(doc.content);
-                console.log(`[QdrantDB] 🔤 Generated BM25 sparse vector for doc ${index}: ${sparseVector.indices.length} dimensions`);
+                // Generate sparse vector with term frequencies using wink-nlp tokenizer
+                const tokenizer = this.getTokenizer(collectionName);
+                const sparseVector = tokenizer.generateSparseVector(doc.content);
+                console.log(`[QdrantDB] 🔤 Generated sparse vector (TF only) for doc ${index}: ${sparseVector.indices.length} terms - IDF applied by Qdrant`);
 
                 return {
                     id: doc.id,
@@ -531,7 +479,7 @@ export class QdrantVectorDatabase implements VectorDatabase {
             console.log(`[QdrantDB] ✅ Upsert call completed`);
             console.log(`[QdrantDB] 📊 Upsert response:`, JSON.stringify(result, null, 2));
 
-            if (result && result.status === 'acknowledged') {
+            if (result && (result.status === 'acknowledged' || result.status === 'completed')) {
                 console.log(`[QdrantDB] 🔍 Qdrant acknowledged insertion of ${documents.length} points`);
 
                 try {
@@ -540,6 +488,10 @@ export class QdrantVectorDatabase implements VectorDatabase {
                 } catch (checkError) {
                     console.warn(`[QdrantDB] ⚠️  Failed to verify points count:`, checkError);
                 }
+                
+                // Save vocabulary after successful insertion
+                const tokenizer = this.getTokenizer(collectionName);
+                tokenizer.saveVocabulary();
             } else {
                 console.warn(`[QdrantDB] ⚠️  Unexpected Qdrant response:`, result);
             }
@@ -649,8 +601,8 @@ export class QdrantVectorDatabase implements VectorDatabase {
                 } else {
                     // Sparse vector prefetch using BM25
                     const queryText = typeof request.data === 'string' ? request.data : '';
-                    const vocabManager = this.getVocabularyManager(collectionName);
-                    const querySparseVector = vocabManager.generateBM25Vector(queryText);
+                    const tokenizer = this.getTokenizer(collectionName);
+                    const querySparseVector = await tokenizer.generateSparseVector(queryText);
                     
                     prefetchQueries.push({
                         prefetch: [],
